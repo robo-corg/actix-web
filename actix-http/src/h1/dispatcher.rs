@@ -3,12 +3,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{fmt, io, net};
+use std::mem;
 
 use actix_codec::{AsyncRead, AsyncWrite, Decoder, Encoder, Framed, FramedParts};
 use actix_rt::time::{delay_until, Delay, Instant};
 use actix_service::Service;
 use bitflags::bitflags;
-use bytes::{Buf, BytesMut};
+use bytes::{self, Buf, BytesMut, BufMut};
 use log::{error, trace};
 
 use crate::body::{Body, BodySize, MessageBody, ResponseBody};
@@ -833,32 +834,25 @@ where
     }
 }
 
-use bytes::{self, BufMut};
-use std::mem;
-
-struct MaxBuf<'a>(usize, &'a mut BytesMut);
+/// BufMut impl that does not grow beyond `.capacity()`
+struct MaxBuf<'a>(&'a mut BytesMut);
 
 impl <'a> BufMut for MaxBuf<'a> {
     #[inline]
     fn remaining_mut(&self) -> usize {
-        if self.1.len() <= self.0 {
-            self.0 - self.1.len()
-        }
-        else {
-            0
-        }
+        self.0.capacity() - self.0.len()
     }
 
     #[inline]
     unsafe fn advance_mut(&mut self, cnt: usize) {
-        self.1.advance_mut(cnt)
+        self.0.advance_mut(cnt)
     }
 
     #[inline]
     fn bytes_mut(&mut self) -> &mut [mem::MaybeUninit<u8>] {
-        let remaining = self.1.capacity() - self.1.len();
-        // Unlike the normal trait impl set the upper bound to the remaining
-        &mut BufMut::bytes_mut(self.1)[..remaining]
+        let remaining = self.remaining_mut();
+        // Unlike the normal trait impl set the upper bound on the slice to the remaining
+        &mut BufMut::bytes_mut(self.0)[..remaining]
     }
 }
 
@@ -870,16 +864,22 @@ fn read_available<T>(
 where
     T: AsyncRead + Unpin,
 {
-
-
     let mut read_some = false;
+
     loop {
         let remaining = buf.capacity() - buf.len();
+
+        // If buf is full return but do not disconnect since
+        // there is more reading to be done
+        if buf.len() >= HW_BUFFER_SIZE {
+            return Ok(Some(false));
+        }
+
         if remaining < LW_BUFFER_SIZE {
             buf.reserve(HW_BUFFER_SIZE - remaining);
         }
 
-        match read(cx, io, &mut MaxBuf(HW_BUFFER_SIZE, buf)) {
+        match read(cx, io, &mut MaxBuf(buf)) {
             Poll::Pending => {
                 return if read_some { Ok(Some(false)) } else { Ok(None) };
             }
