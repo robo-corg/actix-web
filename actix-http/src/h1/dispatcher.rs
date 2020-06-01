@@ -858,6 +858,35 @@ where
     }
 }
 
+use bytes::{self, BufMut};
+use std::mem;
+
+struct MaxBuf<'a>(usize, &'a mut BytesMut);
+
+impl <'a> BufMut for MaxBuf<'a> {
+    #[inline]
+    fn remaining_mut(&self) -> usize {
+        if self.1.len() <= self.0 {
+            self.0 - self.1.len()
+        }
+        else {
+            0
+        }
+    }
+
+    #[inline]
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        self.1.advance_mut(cnt)
+    }
+
+    #[inline]
+    fn bytes_mut(&mut self) -> &mut [mem::MaybeUninit<u8>] {
+        let remaining = self.1.capacity() - self.1.len();
+        // Unlike the normal trait impl set the upper bound to the remaining
+        &mut BufMut::bytes_mut(self.1)[..remaining]
+    }
+}
+
 fn read_available<T>(
     cx: &mut Context<'_>,
     io: &mut T,
@@ -866,6 +895,8 @@ fn read_available<T>(
 where
     T: AsyncRead + Unpin,
 {
+
+
     let mut read_some = false;
     loop {
         let remaining = buf.capacity() - buf.len();
@@ -873,7 +904,7 @@ where
             buf.reserve(HW_BUFFER_SIZE - remaining);
         }
 
-        match read(cx, io, buf) {
+        match read(cx, io, &mut MaxBuf(HW_BUFFER_SIZE, buf)) {
             Poll::Pending => {
                 return if read_some { Ok(Some(false)) } else { Ok(None) };
             }
@@ -901,10 +932,10 @@ where
     }
 }
 
-fn read<T>(
+fn read<'a, T>(
     cx: &mut Context<'_>,
     io: &mut T,
-    buf: &mut BytesMut,
+    buf: &'a mut MaxBuf<'a>,
 ) -> Poll<Result<usize, io::Error>>
 where
     T: AsyncRead + Unpin,
